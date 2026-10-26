@@ -34,7 +34,9 @@ import (
 	"github.com/perses/spec/go/common"
 	"github.com/perses/spec/go/module"
 	pluginSpec "github.com/perses/spec/go/plugin"
+	"github.com/prometheus/common/version"
 	"github.com/spf13/cobra"
+	"golang.org/x/mod/semver"
 )
 
 type generateOptions struct {
@@ -49,9 +51,11 @@ type generateOptions struct {
 	outputDir         string
 	// goModuleMissing is true when the output directory has no go.mod yet, so one has to be created.
 	goModuleMissing bool
-	ctx             context.Context
-	writer          io.Writer
-	errWriter       io.Writer
+	// goSDK is true when the generated plugin has a Go SDK, so its dependencies have to be resolved.
+	goSDK     bool
+	ctx       context.Context
+	writer    io.Writer
+	errWriter io.Writer
 }
 
 type ExposedModule struct {
@@ -94,6 +98,11 @@ var availablePluginTypes = []pluginSpec.Kind{
 	pluginSpec.KindExplore,
 }
 
+// goSDKPluginTypes are the plugin types for which a Go SDK is generated.
+var goSDKPluginTypes = []pluginSpec.Kind{
+	pluginSpec.KindTimeSeriesQuery,
+}
+
 func (o *generateOptions) Validate() error {
 	destDir, err := filepath.Abs(o.outputDir)
 	if err != nil {
@@ -106,16 +115,18 @@ func (o *generateOptions) Validate() error {
 
 	o.outputDir = destDir
 
-	if err := o.checkGoModuleRequirements(); err != nil {
-		return err
-	}
-
 	if o.pluginName == "" || o.pluginType == "" {
 		return fmt.Errorf("plugin.name and plugin.type are required")
 	}
 
 	if !slices.Contains(availablePluginTypes, o.pluginType) {
 		return fmt.Errorf("plugin.type %q is not valid, possible values are: %s", o.pluginType, availablePluginTypes)
+	}
+
+	o.goSDK = slices.Contains(goSDKPluginTypes, o.pluginType)
+
+	if err := o.checkGoModuleRequirements(); err != nil {
+		return err
 	}
 
 	o.pluginName = GetKebabCase(o.pluginName)
@@ -278,6 +289,7 @@ func (o *generateOptions) Execute() error {
 		"ModuleOrg":                GetKebabCase(o.pluginModuleOrg),
 		"PluginName":               GetKebabCase(o.pluginName),
 		"PluginPascalName":         o.pluginPascalName,
+		"PluginGoPackage":          goPackageName(o.pluginName),
 		"ExposedModules":           exposedModules,
 		"PersesPlugins":            persesPlugins,
 		"PersesPanelPlugins":       persesPanelPlugins,
@@ -370,8 +382,19 @@ func (o *generateOptions) successMessage(isModuleGeneration bool, createdPaths [
 	return msg
 }
 
+// goPackageName returns the name of the Go package of a plugin, from the kebab case name of the plugin.
+func goPackageName(pluginName string) string {
+	name := strings.ReplaceAll(GetKebabCase(pluginName), "-", "")
+	if name != "" && name[0] >= '0' && name[0] <= '9' {
+		name = "plugin" + name
+	}
+
+	return name
+}
+
 // checkGoModuleRequirements records whether the output directory needs a go.mod and, if so, checks that the go binary
 // is available. It runs before anything is written, so the command doesn't leave a half-generated module behind.
+// The go binary is also required when a Go SDK is generated, since its dependencies have to be resolved.
 func (o *generateOptions) checkGoModuleRequirements() error {
 	goModExists, err := file.Exists(filepath.Join(o.outputDir, "go.mod"))
 	if err != nil {
@@ -379,7 +402,7 @@ func (o *generateOptions) checkGoModuleRequirements() error {
 	}
 
 	o.goModuleMissing = !goModExists
-	if !o.goModuleMissing {
+	if !o.goModuleMissing && !o.goSDK {
 		return nil
 	}
 
@@ -408,27 +431,60 @@ func (o *generateOptions) goModulePath() (string, error) {
 	return fmt.Sprintf("github.com/%s/%s", org, name), nil
 }
 
-// ensureGoModule initializes the Go module with `go mod init` and `go mod tidy` when the output directory
-// doesn't have a go.mod yet. An existing go.mod is left untouched. It returns the relative paths of the created files.
+// persesVersion is the version of percli. It is a variable so that tests can change it.
+var persesVersion = func() string { return version.Version }
+
+// persesModuleVersion returns the version of github.com/perses/perses that matches this percli, or an empty string
+// when percli doesn't have a release version, for example in a development build.
+func persesModuleVersion() string {
+	v := persesVersion()
+	if v != "" && !strings.HasPrefix(v, "v") {
+		v = "v" + v
+	}
+	if !semver.IsValid(v) {
+		return ""
+	}
+
+	return v
+}
+
+// ensureGoModule sets up the Go module of the output directory:
+//   - `go mod init` when the directory doesn't have a go.mod yet. An existing go.mod is never replaced.
+//   - `go get github.com/perses/perses@<percli version>` when a Go SDK was generated, so that the dependency matches
+//     the SDK templates of this percli. Without it, `go mod tidy` would resolve the latest version, which may not be
+//     compatible. It is skipped when percli doesn't have a release version.
+//   - `go mod tidy` when the module was created or a Go SDK was generated, since a new plugin adds new imports.
+//
+// It returns the relative paths of the created files.
 func (o *generateOptions) ensureGoModule(modulePath string) ([]string, error) {
-	if !o.goModuleMissing {
+	if !o.goModuleMissing && !o.goSDK {
 		return nil, nil
 	}
+
+	var commands [][]string
+	if o.goModuleMissing {
+		commands = append(commands, []string{"mod", "init", modulePath})
+	}
+	if v := persesModuleVersion(); o.goSDK && v != "" {
+		commands = append(commands, []string{"get", "github.com/perses/perses@" + v})
+	}
+	commands = append(commands, []string{"mod", "tidy"})
 
 	ctx := o.ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	for _, args := range [][]string{
-		{"mod", "init", modulePath},
-		{"mod", "tidy"},
-	} {
+	for _, args := range commands {
 		cmd := exec.CommandContext(ctx, "go", args...) //nolint:gosec // the arguments are passed straight to exec, no shell is involved
 		cmd.Dir = o.outputDir
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return nil, fmt.Errorf("`go %s` failed under %q: %w\n%s", strings.Join(args, " "), o.outputDir, err, out)
 		}
+	}
+
+	if !o.goModuleMissing {
+		return nil, nil
 	}
 
 	created := []string{"go.mod"}

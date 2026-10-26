@@ -1,0 +1,72 @@
+// Package {{ .PluginGoPackage }} is the Go SDK of the {{ .PluginPascalName }} query plugin. It lets Dashboard-as-Code
+// programs build the query with the Perses Go SDK.
+package {{ .PluginGoPackage }}
+
+import (
+	"github.com/perses/perses/go-sdk/datasource"
+	"github.com/perses/perses/go-sdk/query"
+	"github.com/perses/spec/go/plugin"
+)
+
+// PluginKind is the kind of the plugin, it must match the kind of the schema under schemas/queries.
+const PluginKind = "{{ .PluginPascalName }}"
+
+// DatasourceKind is the kind of the datasource the query runs on.
+// TODO: set it to the kind of your datasource plugin, it must match the datasource kind of the schema.
+const DatasourceKind = "YourDatasourceKind"
+
+// PluginSpec is the spec of the plugin. Keep it in sync with the schema under schemas/queries.
+type PluginSpec struct {
+	Datasource *datasource.Selector `json:"datasource,omitempty" yaml:"datasource,omitempty"`
+	Query      string               `json:"query" yaml:"query"`
+}
+
+// Builder builds the spec of the plugin.
+type Builder struct {
+	PluginSpec `json:",inline" yaml:",inline"`
+}
+
+// Option sets a field of the spec.
+type Option func(builder *Builder) error
+
+// Query sets the query to run.
+func Query(expr string) Option {
+	return func(builder *Builder) error {
+		builder.Query = expr
+		return nil
+	}
+}
+
+// Datasource sets the datasource to run the query on. The name is either the name of a datasource,
+// or a variable reference such as "$datasource".
+func Datasource(name string) Option {
+	return func(builder *Builder) error {
+		selector, err := datasource.NewSelector(DatasourceKind, name)
+		if err != nil {
+			return err
+		}
+		builder.Datasource = selector
+		return nil
+	}
+}
+
+// New returns the query option to add to a panel, with the given query and the other options applied.
+func New(expr string, options ...Option) query.Option {
+	builder := &Builder{}
+
+	var err error
+	for _, opt := range append([]Option{Query(expr)}, options...) {
+		if err = opt(builder); err != nil {
+			break
+		}
+	}
+
+	return query.Option{
+		Kind: plugin.KindTimeSeriesQuery,
+		Plugin: plugin.Plugin{
+			Kind: PluginKind,
+			Spec: *builder,
+		},
+		Error: err,
+	}
+}
