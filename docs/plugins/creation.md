@@ -85,6 +85,7 @@ Perses CLI (`percli`) has a plugin option that helps you create and manage your 
     `Datasource`, `TimeSeriesQuery` , `TraceQuery`, `ProfileQuery`, `LogQuery`, `Variable`, `Annotation`, `Panel`, or `Explore`.
   - `--plugin.display-name`: The more human name of the plugin to be used in the UI. If not provided, the plugin name will be used.
   - `[<plugin module directory>]`: The plugin module directory is optional and the current directory will be used if not provided.
+  - The command needs the `go` binary. It creates the Go module of the plugin module with `go mod init` when there is no `go.mod`, and never replaces an existing one. For a `TimeSeriesQuery` plugin it also generates a Go SDK under `sdk/go/<plugin name>`, built on the Perses Go SDK. It then pins `github.com/perses/perses` to the version of `percli` and runs `go mod tidy`, so the dependencies match the generated code.
 - `percli plugin build`: Build the plugin module and create the archive file.
 
 Check the [CLI documentation](../cli.md) for more details.

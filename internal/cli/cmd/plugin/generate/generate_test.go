@@ -15,6 +15,7 @@ package generate
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -245,4 +246,65 @@ func TestPluginGenerateFailsBeforeWritingWithEmptyRegistry(t *testing.T) {
 
 	assert.NoDirExists(t, filepath.Join(dir, "src", "panels", "my-test-panel"))
 	assert.NoFileExists(t, filepath.Join(dir, "go.mod"))
+}
+
+func TestPersesModuleVersion(t *testing.T) {
+	oldVersion := persesVersion
+	t.Cleanup(func() { persesVersion = oldVersion })
+
+	for version, expected := range map[string]string{
+		"":                "",
+		"v0.55.0":         "v0.55.0",
+		"0.55.0":          "v0.55.0",
+		"v0.55.0-rc.1":    "v0.55.0-rc.1",
+		"not-a-version":   "",
+		"v0.55.0-dirty+x": "v0.55.0-dirty+x",
+	} {
+		persesVersion = func() string { return version }
+		assert.Equal(t, expected, persesModuleVersion(), "version %q", version)
+	}
+}
+
+func TestGoPackageName(t *testing.T) {
+	assert.Equal(t, "mytestquery", goPackageName("MyTestQuery"))
+	assert.Equal(t, "mytestquery", goPackageName("my-test-query"))
+	assert.Equal(t, "plugin2fa", goPackageName("2fa"))
+}
+
+func TestPluginGenerateTimeSeriesQueryGoSDK(t *testing.T) {
+	if testing.Short() {
+		t.Skip("resolving the Go dependencies needs network access")
+	}
+
+	oldVersion := persesVersion
+	t.Cleanup(func() { persesVersion = oldVersion })
+	persesVersion = func() string { return "v0.55.0-rc.1" }
+
+	dir := t.TempDir()
+
+	for _, name := range []string{"MyTestQuery", "MyOtherQuery"} {
+		cmdTest.ExecuteSuiteTest(t, NewCMD, []cmdTest.Suite{
+			{
+				Title: "Build a TimeSeriesQuery plugin with its Go SDK",
+				Args: []string{
+					"--module.name", "MyPluginModule",
+					"--module.org", "MyPluginOrg",
+					"--plugin.name", name,
+					"--plugin.type", "TimeSeriesQuery",
+					dir,
+				},
+				ExpectedRegexMessage: `sdk[/\\]go[/\\]` + strings.ToLower(name[:2]) + `[a-z-]+[/\\]` + `[a-z-]+\.go`,
+			},
+		})
+	}
+
+	goMod, err := os.ReadFile(filepath.Join(dir, "go.mod")) //nolint:gosec // dir is a t.TempDir
+	require.NoError(t, err)
+	assert.Contains(t, string(goMod), "github.com/perses/perses v0.55.0-rc.1")
+
+	// The SDK of both plugins compiles against the pinned version.
+	build := exec.Command("go", "build", "./...")
+	build.Dir = dir
+	out, err := build.CombinedOutput()
+	require.NoError(t, err, string(out))
 }
